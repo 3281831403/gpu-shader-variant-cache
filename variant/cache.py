@@ -25,9 +25,112 @@ offline, and use only the Python standard library.  Stable keys use
 wall clock, the network, or random state, and nothing sleeps.
 """
 
+import copy
+import hashlib
+import json
+import math
+from collections.abc import Mapping
+
+_MISSING = object()
+
 
 class VariantError(Exception):
     """Raised for invalid variant-cache input or an impossible request."""
+
+
+def _is_int(value) -> bool:
+    """Return ``True`` for a real integer, excluding ``bool``."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_positive_int(value) -> bool:
+    """Return ``True`` for a strictly positive real integer."""
+    return _is_int(value) and value > 0
+
+
+def _canonical(value, _seen=None):
+    """Return a deterministic JSON-encodable form of one feature value.
+
+    Mappings are rebuilt with their keys validated and left for
+    :func:`json.dumps`'s ``sort_keys`` to order; lists keep their order.
+    Values that cannot be encoded deterministically raise :class:`VariantError`.
+    """
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise VariantError("feature value is not a finite number")
+        return value
+    if isinstance(value, (list, Mapping)):
+        if _seen is None:
+            _seen = set()
+        identity = id(value)
+        if identity in _seen:
+            raise VariantError("feature value contains a cycle")
+        _seen.add(identity)
+        try:
+            if isinstance(value, list):
+                return [_canonical(item, _seen) for item in value]
+            result = {}
+            for name, item in value.items():
+                if not isinstance(name, str):
+                    raise VariantError("feature names must be strings")
+                result[name] = _canonical(item, _seen)
+            return result
+        finally:
+            _seen.discard(identity)
+    raise VariantError(
+        "feature value of type "
+        f"{type(value).__name__} cannot be encoded deterministically"
+    )
+
+
+def _feature_mapping(value, label: str) -> Mapping:
+    """Validate a variant dict and return its ``"features"`` mapping."""
+    if not isinstance(value, Mapping):
+        raise VariantError(f"{label} must be a variant mapping")
+    features = value.get("features")
+    if not isinstance(features, Mapping):
+        raise VariantError(f"{label} must contain a mapping under 'features'")
+    return features
+
+
+def _require_cache(cache) -> list:
+    """Validate the shared cache envelope and return its slot list."""
+    if not isinstance(cache, dict):
+        raise VariantError("cache must be a mutable mapping")
+    slots = cache.get("slots")
+    if not isinstance(slots, list):
+        raise VariantError("cache['slots'] must be a list")
+    clock = cache.get("clock")
+    if not _is_int(clock) or clock < 0:
+        raise VariantError("cache['clock'] must be a non-negative integer")
+    for index, slot in enumerate(slots):
+        if not isinstance(slot, dict):
+            raise VariantError(f"cache slot {index} must be a mapping")
+        if not isinstance(slot.get("key"), str):
+            raise VariantError(f"cache slot {index} has no string key")
+        if not _is_int(slot.get("last_used")):
+            raise VariantError(f"cache slot {index} has no integer last_used")
+    return slots
+
+
+def _evict(cache: dict) -> None:
+    """Remove the least recently used slot (ties break by lowest index)."""
+    slots = cache["slots"]
+    victim = min(
+        range(len(slots)),
+        key=lambda index: (slots[index]["last_used"], index),
+    )
+    del slots[victim]
+
+
+def _trim_to_capacity(cache: dict, capacity: int) -> None:
+    """Evict LRU slots until the cache holds at most ``capacity`` slots."""
+    while len(cache["slots"]) > capacity:
+        _evict(cache)
 
 
 def variant_key(base: str, features: dict) -> str:
@@ -58,7 +161,17 @@ def variant_key(base: str, features: dict) -> str:
             mapping with a mapping under ``"features"``, or a value cannot be
             encoded deterministically.
     """
-    raise NotImplementedError
+    if not isinstance(base, str) or not base:
+        raise VariantError("base must be a non-empty string")
+    feature_map = _feature_mapping(features, "features")
+    payload = json.dumps(
+        {"base": base, "features": _canonical(feature_map)},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def lookup(cache: dict, key: str) -> int:
@@ -82,7 +195,15 @@ def lookup(cache: dict, key: str) -> int:
     Raises:
         VariantError: ``cache`` or ``key`` is malformed.
     """
-    raise NotImplementedError
+    slots = _require_cache(cache)
+    if not isinstance(key, str) or not key:
+        raise VariantError("key must be a non-empty string")
+    for index, slot in enumerate(slots):
+        if slot["key"] == key:
+            slot["last_used"] = cache["clock"]
+            cache["clock"] += 1
+            return index
+    return -1
 
 
 def insert(cache: dict, key: str, program: str, capacity: int) -> dict:
@@ -115,7 +236,37 @@ def insert(cache: dict, key: str, program: str, capacity: int) -> dict:
         VariantError: ``capacity`` is not a positive integer, ``program`` or
             ``key`` is empty or malformed, or ``cache`` has an invalid shape.
     """
-    raise NotImplementedError
+    if not _is_positive_int(capacity):
+        raise VariantError("capacity must be a positive integer")
+    if not isinstance(key, str) or not key:
+        raise VariantError("key must be a non-empty string")
+    if not isinstance(program, str) or not program:
+        raise VariantError("program must be a non-empty string")
+    slots = _require_cache(cache)
+
+    cache["capacity"] = capacity
+    _trim_to_capacity(cache, capacity)
+
+    for slot in slots:
+        if slot["key"] == key:
+            slot["program"] = program
+            slot["last_used"] = cache["clock"]
+            cache["clock"] += 1
+            return cache
+
+    if len(slots) >= capacity:
+        _evict(cache)
+
+    slots.append(
+        {
+            "key": key,
+            "program": program,
+            "last_used": cache["clock"],
+            "deps": [],
+        }
+    )
+    cache["clock"] += 1
+    return cache
 
 
 def compile_budget(pending: list[dict], max_ms: int) -> list[str]:
@@ -142,7 +293,28 @@ def compile_budget(pending: list[dict], max_ms: int) -> list[str]:
         VariantError: ``max_ms`` is not a non-negative integer, or an item is
             malformed or has a negative/non-integer ``ms``.
     """
-    raise NotImplementedError
+    if not _is_int(max_ms) or max_ms < 0:
+        raise VariantError("max_ms must be a non-negative integer")
+    if not isinstance(pending, list):
+        raise VariantError("pending must be a list")
+
+    spent_ms = 0
+    selected = []
+    for index, item in enumerate(pending):
+        if not isinstance(item, Mapping):
+            raise VariantError(f"pending item {index} must be a mapping")
+        key = item.get("key")
+        cost = item.get("ms")
+        if not isinstance(key, str) or not key:
+            raise VariantError(f"pending item {index} has no non-empty string key")
+        if not _is_int(cost) or cost < 0:
+            raise VariantError(
+                f"pending item {index} ms must be a non-negative integer"
+            )
+        if spent_ms + cost <= max_ms:
+            selected.append(key)
+            spent_ms += cost
+    return selected
 
 
 def invalidate(cache: dict, changed_files: list[str]) -> list[str]:
@@ -167,7 +339,32 @@ def invalidate(cache: dict, changed_files: list[str]) -> list[str]:
         VariantError: a slot is missing a well-formed dependency list or
             ``changed_files`` is malformed.
     """
-    raise NotImplementedError
+    slots = _require_cache(cache)
+    if not isinstance(changed_files, list):
+        raise VariantError("changed_files must be a list of strings")
+    for name in changed_files:
+        if not isinstance(name, str):
+            raise VariantError("changed_files must contain only strings")
+
+    for index, slot in enumerate(slots):
+        deps = slot.get("deps")
+        if not isinstance(deps, list) or any(
+            not isinstance(dep, str) for dep in deps
+        ):
+            raise VariantError(
+                f"cache slot {index} has no well-formed dependency list"
+            )
+
+    changed = set(changed_files)
+    removed = []
+    survivors = []
+    for slot in slots:
+        if any(dep in changed for dep in slot["deps"]):
+            removed.append(slot["key"])
+        else:
+            survivors.append(slot)
+    slots[:] = survivors
+    return removed
 
 
 def merge_features(a: dict, b: dict) -> dict:
@@ -195,7 +392,20 @@ def merge_features(a: dict, b: dict) -> dict:
         VariantError: either argument is not a variant dict with a mapping
             under ``"features"``.
     """
-    raise NotImplementedError
+    features_a = _feature_mapping(a, "a")
+    features_b = _feature_mapping(b, "b")
+    for name in list(features_a) + list(features_b):
+        if not isinstance(name, str):
+            raise VariantError("feature names must be strings")
+
+    merged = dict(features_a)
+    conflicts = []
+    for name, value in features_b.items():
+        if name in merged and merged[name] != value:
+            conflicts.append(name)
+        merged[name] = value
+    conflicts.sort()
+    return {"features": merged, "conflicts": conflicts}
 
 
 def validate_cache(cache: dict, capacity: int) -> list[str]:
@@ -225,7 +435,114 @@ def validate_cache(cache: dict, capacity: int) -> list[str]:
     Raises:
         VariantError: ``cache`` itself is not a mapping.
     """
-    raise NotImplementedError
+    if not isinstance(cache, Mapping):
+        raise VariantError("cache must be a mapping")
+
+    issues = []
+    slots = cache.get("slots")
+    if not isinstance(slots, list):
+        issues.append("capacity mismatch: cache has no slot list")
+        slots = []
+
+    if not _is_positive_int(capacity):
+        issues.append(
+            "capacity mismatch: expected capacity must be a positive integer, "
+            f"got {capacity!r}"
+        )
+    else:
+        stored = cache.get("capacity")
+        if not _is_int(stored) or stored != capacity:
+            issues.append(
+                f"capacity mismatch: cache capacity {stored!r} does not match "
+                f"expected {capacity!r}"
+            )
+        if len(slots) > capacity:
+            issues.append(
+                f"capacity mismatch: {len(slots)} slots exceed capacity "
+                f"{capacity!r}"
+            )
+
+    positions = {}
+    for index, slot in enumerate(slots):
+        if isinstance(slot, Mapping):
+            slot_key = slot.get("key")
+            if isinstance(slot_key, str):
+                positions.setdefault(slot_key, []).append(index)
+    for slot_key, indexes in positions.items():
+        if len(indexes) > 1:
+            issues.append(
+                f"duplicate key: {slot_key!r} appears at slots {indexes}"
+            )
+
+    for index, slot in enumerate(slots):
+        if not isinstance(slot, Mapping):
+            issues.append(f"empty program: slot {index} is not a mapping")
+            continue
+        program = slot.get("program", _MISSING)
+        if program is _MISSING or program is None or (
+            isinstance(program, str) and program == ""
+        ):
+            issues.append(f"empty program: slot {index} has no program")
+    return issues
+
+
+def _validate_request(request: dict) -> tuple:
+    """Validate one batch request and return ``(key, program, deps)``."""
+    if not isinstance(request, Mapping):
+        raise VariantError("each request must be a mapping")
+    base = request.get("base")
+    if not isinstance(base, str) or not base:
+        raise VariantError("request base must be a non-empty string")
+    features = request.get("features")
+    _feature_mapping(features, "request features")
+    program = request.get("program")
+    if not isinstance(program, str) or not program:
+        raise VariantError("request program must be a non-empty string")
+    deps = request.get("deps", _MISSING)
+    if deps is _MISSING:
+        deps = []
+    if not isinstance(deps, list) or any(
+        not isinstance(dep, str) for dep in deps
+    ):
+        raise VariantError("request deps must be a list of strings")
+    return variant_key(base, features), program, list(deps)
+
+
+def _copy_seed(seed, capacity: int) -> dict:
+    """Return a private working cache built from an optional seed cache."""
+    if seed is _MISSING or seed is None:
+        return {"capacity": capacity, "clock": 0, "slots": []}
+    if not isinstance(seed, Mapping):
+        raise VariantError("seed cache must be a mapping")
+    slots = seed.get("slots")
+    clock = seed.get("clock", 0)
+    if not isinstance(slots, list):
+        raise VariantError("seed cache has no slot list")
+    if not _is_int(clock) or clock < 0:
+        raise VariantError("seed cache clock must be a non-negative integer")
+    for index, slot in enumerate(slots):
+        if not isinstance(slot, Mapping):
+            raise VariantError(f"seed slot {index} must be a mapping")
+        if not isinstance(slot.get("key"), str) or not slot["key"]:
+            raise VariantError(f"seed slot {index} has no non-empty string key")
+        program = slot.get("program")
+        if not isinstance(program, str) or not program:
+            raise VariantError(f"seed slot {index} has no program")
+        if not _is_int(slot.get("last_used")):
+            raise VariantError(f"seed slot {index} has no integer last_used")
+        deps = slot.get("deps", [])
+        if not isinstance(deps, list) or any(
+            not isinstance(dep, str) for dep in deps
+        ):
+            raise VariantError(f"seed slot {index} has no dependency list")
+
+    working = {
+        "capacity": capacity,
+        "clock": clock,
+        "slots": copy.deepcopy(list(slots)),
+    }
+    _trim_to_capacity(working, capacity)
+    return working
 
 
 def variant_batch(requests: list[dict], config: dict) -> dict:
@@ -271,4 +588,38 @@ def variant_batch(requests: list[dict], config: dict) -> dict:
         VariantError: capacity is invalid, any request is malformed or has an
             empty program, or the seed cache is malformed.
     """
-    raise NotImplementedError
+    if not isinstance(config, Mapping):
+        raise VariantError("config must be a mapping")
+    capacity = config.get("capacity")
+    if not _is_positive_int(capacity):
+        raise VariantError("config capacity must be a positive integer")
+    if not isinstance(requests, list):
+        raise VariantError("requests must be a list")
+
+    if not requests:
+        return {}
+
+    # Validate every request before doing any compile work, so one bad request
+    # rolls back the whole batch.
+    validated = [_validate_request(request) for request in requests]
+
+    working = _copy_seed(config.get("cache", _MISSING), capacity)
+
+    results = []
+    for key, program, deps in validated:
+        index = lookup(working, key)
+        if index != -1:
+            results.append(
+                {
+                    "key": key,
+                    "program": working["slots"][index]["program"],
+                    "slot": index,
+                }
+            )
+            continue
+        insert(working, key, program, capacity)
+        index = len(working["slots"]) - 1
+        working["slots"][index]["deps"] = list(deps)
+        results.append({"key": key, "program": program, "slot": index})
+
+    return {"results": results, "cache": working}
